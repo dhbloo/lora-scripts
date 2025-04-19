@@ -201,6 +201,207 @@ class WaifuDiffusionInterrogator(Interrogator):
         return ratings, tags
 
 
+class JointTaggerInterrogator(Interrogator):
+    """
+    Code based on RedRocket Joint Tagger Project
+    https://huggingface.co/RedRocket/JointTaggerProject
+    """
+    def __init__(
+        self,
+        name: str,
+        model_path: str,
+        tags_path: str,
+        repo_id: str = "RedRocket/JointTaggerProject",
+        gated_head: bool = False,
+        **kwargs
+    ) -> None:
+        super().__init__(name)
+        self.model_path = model_path
+        self.tags_path = tags_path
+        self.repo_id = repo_id
+        self.gated_head = gated_head
+        self.kwargs = kwargs
+    
+    def download(self) -> Tuple[os.PathLike, os.PathLike]:
+        print(f"Loading {self.name} model file from {self.repo_id}")
+
+        model_path = Path(hf_hub_download(
+            **self.kwargs, repo_id=self.repo_id, filename=self.model_path))
+        tags_path = Path(hf_hub_download(
+            **self.kwargs, repo_id=self.repo_id, filename=self.tags_path))
+        return model_path, tags_path
+
+    def load_model(self, model_path: os.PathLike):
+        import timm
+        import torch
+        import safetensors
+        self.model = timm.create_model(
+            "vit_so400m_patch14_siglip_384.webli",
+            pretrained=False,
+            num_classes=9083,
+        )
+        if self.gated_head:
+            class GatedHead(torch.nn.Module):
+                def __init__(self,
+                    num_features: int,
+                    num_classes: int
+                ):
+                    super().__init__()
+                    self.num_classes = num_classes
+                    self.linear = torch.nn.Linear(num_features, num_classes * 2)
+
+                    self.act = torch.nn.Sigmoid()
+                    self.gate = torch.nn.Sigmoid()
+
+                def forward(self, x: torch.Tensor) -> torch.Tensor:
+                    x = self.linear(x)
+                    x = self.act(x[:, :self.num_classes]) * self.gate(x[:, self.num_classes:])
+                    return x
+                
+            self.model.head = GatedHead(min(self.model.head.weight.shape), 9083)
+
+        safetensors.torch.load_model(self.model, model_path)
+        self.model.eval()
+
+    def load_tags(self, tags_path: os.PathLike):
+        with open(tags_path, "r") as file:
+            tags = json.load(file) # type: dict
+        self.tags = list(tags.keys())
+
+    def load_transform(self):
+        import torch
+        import torchvision.transforms.functional as TF
+        from torchvision.transforms import transforms, InterpolationMode
+
+        class Fit(torch.nn.Module):
+            def __init__(
+                self,
+                bounds: tuple[int, int] | int,
+                interpolation = InterpolationMode.LANCZOS,
+                grow: bool = True,
+                pad: float | None = None
+            ):
+                super().__init__()
+
+                self.bounds = (bounds, bounds) if isinstance(bounds, int) else bounds
+                self.interpolation = interpolation
+                self.grow = grow
+                self.pad = pad
+
+            def forward(self, img: Image) -> Image:
+                wimg, himg = img.size
+                hbound, wbound = self.bounds
+
+                hscale = hbound / himg
+                wscale = wbound / wimg
+
+                if not self.grow:
+                    hscale = min(hscale, 1.0)
+                    wscale = min(wscale, 1.0)
+
+                scale = min(hscale, wscale)
+                if scale == 1.0:
+                    return img
+
+                hnew = min(round(himg * scale), hbound)
+                wnew = min(round(wimg * scale), wbound)
+
+                img = TF.resize(img, (hnew, wnew), self.interpolation)
+
+                if self.pad is None:
+                    return img
+
+                hpad = hbound - hnew
+                wpad = wbound - wnew
+
+                tpad = hpad // 2
+                bpad = hpad - tpad
+
+                lpad = wpad // 2
+                rpad = wpad - lpad
+
+                return TF.pad(img, (lpad, tpad, rpad, bpad), self.pad)
+
+        class CompositeAlpha(torch.nn.Module):
+            def __init__(
+                self,
+                background: tuple[float, float, float] | float,
+            ):
+                super().__init__()
+
+                self.background = (background, background, background) if isinstance(background, float) else background
+                self.background = torch.tensor(self.background).unsqueeze(1).unsqueeze(2)
+
+            def forward(self, img: torch.Tensor) -> torch.Tensor:
+                if img.shape[-3] == 3:
+                    return img
+
+                alpha = img[..., 3, None, :, :]
+
+                img[..., :3, :, :] *= alpha
+
+                background = self.background.expand(-1, img.shape[-2], img.shape[-1])
+                if background.ndim == 1:
+                    background = background[:, None, None]
+                elif background.ndim == 2:
+                    background = background[None, :, :]
+
+                img[..., :3, :, :] += (1.0 - alpha) * background
+                return img[..., :3, :, :]
+
+        self.transform = transforms.Compose([
+            Fit((384, 384)),
+            transforms.ToTensor(),
+            CompositeAlpha(0.5),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True),
+            transforms.CenterCrop((384, 384)),
+        ])
+
+    def to_gpu(self, x):
+        import torch
+        if torch.cuda.is_available():
+            x = x.cuda()
+            if torch.cuda.get_device_capability()[0] >= 7: # tensor cores
+                x = x.to(dtype=torch.float16, memory_format=torch.channels_last)
+        return x
+
+    def load(self) -> None:
+        model_path, tags_path = self.download()
+        self.load_model(model_path)
+        self.load_tags(tags_path)
+        self.load_transform()
+        self.to_gpu(self.model)
+
+    def interrogate(self, image: Image) -> Tuple[
+        Dict[str, float],  # rating confidents
+        Dict[str, float]  # tag confidents
+    ]:
+        # init model
+        if not hasattr(self, 'model') or self.model is None:
+            self.load()
+
+        # run classifier
+        import torch
+        image = image.convert('RGBA')
+        tensor = self.transform(image).unsqueeze(0)
+        tensor = self.to_gpu(tensor)
+
+        with torch.no_grad():
+            if self.gated_head:
+                probits = self.model(tensor)[0].cpu()
+            else:
+                logits = self.model(tensor)
+                probits = torch.nn.functional.sigmoid(logits[0]).cpu()
+            values, indices = probits.topk(250)
+
+        tag_score = dict()
+        for i in range(indices.size(0)):
+            tag_score[self.tags[indices[i]]] = values[i].item()
+
+        ratings = {}
+        return ratings, tag_score
+
+
 available_interrogators = {
     'wd-convnext-v3': WaifuDiffusionInterrogator(
         'wd-convnext-v3',
@@ -238,6 +439,17 @@ available_interrogators = {
     'wd-vit-large-tagger-v3': WaifuDiffusionInterrogator(
         'wd-vit-large-tagger-v3',
         repo_id='SmilingWolf/wd-vit-large-tagger-v3',
+    ),
+    'jtp-pilot-v1': JointTaggerInterrogator(
+        'jtp-pilot-v1',
+        model_path='JTP_PILOT/JTP_PILOT-e4-vit_so400m_patch14_siglip_384.safetensors',
+        tags_path='JTP_PILOT/tags.json',
+    ),
+    'jtp-pilot-v2': JointTaggerInterrogator(
+        'jtp-pilot-v2',
+        model_path='JTP_PILOT2/JTP_PILOT2-e3-vit_so400m_patch14_siglip_384.safetensors',
+        tags_path='JTP_PILOT2/tags.json',
+        gated_head=True,
     ),
 }
 
